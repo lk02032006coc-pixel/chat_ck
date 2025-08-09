@@ -25,6 +25,9 @@ io.on('connection', (socket) => {
   console.log('🧩 WebSocket подключён');
 
   socket.on('send', (data) => {
+    // Relay to all connected clients with 'recv'
+    io.emit('recv', data);
+
     bot.sendMessage(process.env.CHAT_ID, data);
   });
 });

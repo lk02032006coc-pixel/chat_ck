@@ -1,5 +1,4 @@
-\
-    {
+{
       "name": "chatlocal-relay",
       "version": "1.0.0",
       "description": "Simple websocket relay + telegram bridge for chatlocal mod",

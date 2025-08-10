@@ -1,16 +1,10 @@
 // relay/index.js
-// Improved WebSocket relay + Telegram bridge
-// - supports mapping telegram usernames/ids -> Minecraft names (user_mappings.json)
-// - accepts messages from configured group chat (CHAT_ID) and from private messages
-// - marks telegram-origin messages as origin: "telegram" and sets sender to mapped MC name
-// - deduplicates client-origin messages (id + sender::message window)
-// - logs extensively for debugging
-//
-// Configuration via environment variables:
-//  - BOT_TOKEN (or TELEGRAM_BOT_TOKEN)
-//  - CHAT_ID  (or TELEGRAM_CHAT_ID or TELE_CHAT_ID)  <-- target group/channel id (e.g. -1002722201967)
-//  - PORT (Render provides this automatically)
-// NOTE: To receive all group messages, disable BotFather "Privacy Mode" for your bot.
+// Debug-friendly WebSocket relay + Telegram bridge
+// - Logs all updates
+// - Handles message, channel_post, edited_message
+// - Forwards from configured CHAT_ID (or private chats) into Minecraft clients
+// - Forwards client-origin messages to Telegram (avoids loops)
+// - Loads user_mappings.json for mapping Telegram -> Minecraft names
 
 const http = require('http');
 const WebSocket = require('ws');
@@ -21,42 +15,36 @@ const crypto = require('crypto');
 
 require('dotenv').config();
 
-// ----------- Config / envs -------------
+// Config
 const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || process.env.TELEGRAM_CHAT_ID || process.env.TELE_CHAT_ID || '';
 const TELEGRAM_ENABLED = !!(BOT_TOKEN && CHAT_ID);
 
-// ----------- mappings (username/id -> MC nick) -------------
+// Load mappings (username/id -> MC nick)
 const mappingPath = path.join(__dirname, 'user_mappings.json');
-let userMappingsRaw = {};
-let usernameMap = {}; // lowercase username -> mcname
-let idMap = {};       // numeric id string -> mcname
+let usernameMap = {};
+let idMap = {};
 try {
   if (fs.existsSync(mappingPath)) {
     const raw = fs.readFileSync(mappingPath, 'utf8');
-    userMappingsRaw = JSON.parse(raw);
-    // Build normalized maps
-    Object.keys(userMappingsRaw).forEach(k => {
-      const v = userMappingsRaw[k];
-      if (/^-?\d+$/.test(String(k).trim())) {
-        idMap[String(k).trim()] = v;
-      } else {
-        usernameMap[String(k).toLowerCase()] = v;
-      }
+    const obj = JSON.parse(raw);
+    Object.keys(obj).forEach(k => {
+      const v = obj[k];
+      if (/^-?\d+$/.test(String(k).trim())) idMap[String(k).trim()] = v;
+      else usernameMap[String(k).toLowerCase()] = v;
     });
-    console.log('[relay] loaded user_mappings.json; username entries=', Object.keys(usernameMap).length, 'id entries=', Object.keys(idMap).length);
+    console.log('[relay] loaded user mappings; username entries=', Object.keys(usernameMap).length, 'id entries=', Object.keys(idMap).length);
   } else {
-    console.log('[relay] no user_mappings.json found — create relay/user_mappings.json to map Telegram => Minecraft names');
+    console.log('[relay] no user_mappings.json found; create relay/user_mappings.json to map Telegram => Minecraft names');
   }
 } catch (e) {
   console.error('[relay] failed to load user_mappings.json', e);
 }
 
-// ----------- dedupe structures -------------
+// Dedupe helpers
 const recentIds = new Set();
 const recentHashTimestamps = new Map();
-const DEDUPE_WINDOW_MS = 3000; // 3s
-
+const DEDUPE_WINDOW_MS = 3000;
 function pruneRecent() {
   const now = Date.now();
   for (const [k, t] of recentHashTimestamps.entries()) {
@@ -64,20 +52,18 @@ function pruneRecent() {
   }
   if (recentIds.size > 2000) recentIds.clear();
 }
-
 function genId() {
   if (crypto.randomUUID) return crypto.randomUUID();
   return crypto.createHash('sha1').update(String(Math.random()) + Date.now()).digest('hex');
 }
 
-// ----------- HTTP + WebSocket server -------------
+// HTTP & WS server
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 8080;
 const server = http.createServer((req, res) => {
   console.log('[relay] http request', req.method, req.url, 'upgrade=', req.headers['upgrade']);
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('OK');
 });
-
 const wss = new WebSocket.Server({ noServer: true });
 
 wss.on('connection', (ws, req) => {
@@ -89,17 +75,15 @@ wss.on('connection', (ws, req) => {
       try {
         obj = JSON.parse(s);
       } catch (e) {
-        // not JSON - wrap
         obj = { id: genId(), origin: 'client', sender: 'unknown', message: s, ts: Date.now() };
       }
-
       // normalize
       if (!obj.id) obj.id = genId();
       if (!obj.origin) obj.origin = 'client';
       if (!obj.sender) obj.sender = obj.sender || 'unknown';
       if (!obj.message) obj.message = '';
 
-      // dedupe by id and by sender::message within window
+      // dedupe
       const hashKey = `${obj.sender}::${obj.message}`;
       pruneRecent();
       if (recentIds.has(obj.id)) {
@@ -116,15 +100,13 @@ wss.on('connection', (ws, req) => {
 
       console.log('[relay] recv:', JSON.stringify(obj));
 
-      // broadcast to other clients (do not echo back to same ws)
+      // broadcast to other clients (not echo)
       const payload = JSON.stringify(obj);
       wss.clients.forEach(client => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-          client.send(payload);
-        }
+        if (client !== ws && client.readyState === WebSocket.OPEN) client.send(payload);
       });
 
-      // forward to Telegram only if origin=client (avoid loops)
+      // forward to Telegram (only client-origin)
       if (TELEGRAM_ENABLED && obj.origin === 'client') {
         const tgText = `<${obj.sender}> ${obj.message}`;
         bot.telegram.sendMessage(CHAT_ID, tgText)
@@ -146,74 +128,91 @@ wss.on('connection', (ws, req) => {
 });
 
 server.on('upgrade', (req, socket, head) => {
-  console.log('[relay] upgrade attempt from', req.socket && req.socket.remoteAddress, 'headers:', req.headers);
+  console.log('[relay] upgrade attempt from', req.socket && req.socket.remoteAddress, 'headers=', req.headers);
   wss.handleUpgrade(req, socket, head, (ws) => {
     wss.emit('connection', ws, req);
   });
 });
 
-// ----------- Telegram bot setup (Telegraf) -------------
+// Telegram bot
 let bot = null;
 if (TELEGRAM_ENABLED) {
   bot = new Telegraf(BOT_TOKEN);
-  console.log('[relay] Telegram enabled for CHAT_ID=', CHAT_ID);
+  // log bot identity
+  bot.telegram.getMe().then(me => {
+    console.log('[relay] bot identity:', me && me.username ? `@${me.username}` : me);
+  }).catch(e => console.warn('[relay] getMe failed', e));
 
-  // Launch bot (polling)
+  // debug middleware - logs all updates (very verbose)
+  bot.use((ctx, next) => {
+    try {
+      console.log('[relay] TG updateType=', ctx.updateType, 'raw=', JSON.stringify(ctx.update));
+    } catch (e) {
+      console.log('[relay] TG update stringify failed', e);
+    }
+    return next();
+  });
+
   bot.launch().then(() => {
-    console.log('[relay] Telegraf launched (long polling). If group messages are missing, disable BotFather privacy mode (/setprivacy -> Disable).');
+    console.log('[relay] Telegraf launched (polling). If group messages missing, try disabling privacy in @BotFather (/setprivacy -> Disable).');
   }).catch(err => {
     console.error('[relay] Telegraf launch error', err);
   });
 
-  // Handle all incoming messages (text). We use 'message' to capture a bit more types; we extract text if present.
+  // universal handler for text-like content in different update types
+  function extractTextFromCtx(ctx) {
+    if (!ctx || !ctx.update) return null;
+    // plain message
+    if (ctx.update.message) {
+      if (typeof ctx.update.message.text === 'string') return ctx.update.message.text;
+      if (typeof ctx.update.message.caption === 'string') return ctx.update.message.caption;
+    }
+    // channel_post
+    if (ctx.update.channel_post) {
+      if (typeof ctx.update.channel_post.text === 'string') return ctx.update.channel_post.text;
+      if (typeof ctx.update.channel_post.caption === 'string') return ctx.update.channel_post.caption;
+    }
+    // edited_message
+    if (ctx.update.edited_message) {
+      if (typeof ctx.update.edited_message.text === 'string') return ctx.update.edited_message.text;
+      if (typeof ctx.update.edited_message.caption === 'string') return ctx.update.edited_message.caption;
+    }
+    return null;
+  }
+
+  // handle any incoming message-like update
   bot.on('message', async (ctx) => {
     try {
+      // debug: show chat id/type
       const chat = ctx.chat || {};
       const chatIdStr = String(chat.id);
       const chatType = chat.type || '';
-      const from = ctx.from || {};
-      // Determine if we should accept this message:
-      // Accept if either:
-      //  - message came from configured chat (CHAT_ID), OR
-      //  - message is a private chat to bot (chat.type === 'private')
-      // This lets both private PMs and messages in the target group be forwarded.
+      const text = extractTextFromCtx(ctx);
+      if (!text) {
+        console.log('[relay] incoming TG update has no text; ignoring', ctx.updateType);
+        return;
+      }
+
+      // Accept if from configured CHAT_ID (group/channel) OR if private chat
       if (CHAT_ID && String(CHAT_ID) !== chatIdStr && chatType !== 'private') {
-        // Not the configured group and not a private message — ignore
-        // (this prevents forwarding from arbitrary groups)
-        console.log('[relay] telegram message ignored (not target chat or private). chat.id=', chatIdStr, 'configured=', CHAT_ID);
+        // ignore other groups
+        console.log('[relay] telegram msg ignored (not target chat and not private). chat.id=', chatIdStr, 'configured=', CHAT_ID);
         return;
       }
 
-      // Extract text (support text or caption for media)
-      let text = '';
-      if (ctx.message && typeof ctx.message.text === 'string') {
-        text = ctx.message.text;
-      } else if (ctx.message && typeof ctx.message.caption === 'string') {
-        text = ctx.message.caption;
-      } else {
-        // nothing to forward
-        console.log('[relay] telegram message has no text/caption; ignoring', ctx.updateType);
-        return;
-      }
-
-      // Build sender name: prefer mapping by username (case-insensitive), then by numeric id mapping, then username, then first_name
+      // Determine sender mapping
+      const from = ctx.from || {};
       const username = from.username ? String(from.username) : null;
       const fromIdStr = from.id ? String(from.id) : null;
       let mapped = null;
-      if (username) {
-        mapped = usernameMap[username.toLowerCase()];
-      }
-      if (!mapped && fromIdStr && idMap[fromIdStr]) {
-        mapped = idMap[fromIdStr];
-      }
+      if (username && usernameMap[username.toLowerCase()]) mapped = usernameMap[username.toLowerCase()];
+      if (!mapped && fromIdStr && idMap[fromIdStr]) mapped = idMap[fromIdStr];
       if (!mapped) {
-        // Fallback label: if username exists, use it; otherwise combine first_name/last_name or id
         if (username) mapped = username;
         else if (from.first_name || from.last_name) mapped = (from.first_name || '') + (from.last_name ? ' ' + from.last_name : '');
         else mapped = fromIdStr || '[TG]';
       }
 
-      // Build message object to broadcast to clients
       const msgObj = {
         id: genId(),
         origin: 'telegram',
@@ -223,14 +222,10 @@ if (TELEGRAM_ENABLED) {
       };
 
       const payload = JSON.stringify(msgObj);
+      console.log('[relay] tg->broadcast payload=', payload, 'from chat=', chatIdStr, 'type=', chatType);
 
-      console.log('[relay] tg->broadcast from', mapped, 'chat:', chatIdStr, 'payload:', payload);
-
-      // Broadcast to all connected websocket clients
       wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(payload);
-        }
+        if (client.readyState === WebSocket.OPEN) client.send(payload);
       });
 
     } catch (e) {
@@ -238,18 +233,68 @@ if (TELEGRAM_ENABLED) {
     }
   });
 
-  // Optional: handler for commands /start etc. Keep small logs.
+  // also handle channel_post specifically (some updates may come as channel_post)
+  bot.on('channel_post', async (ctx) => {
+    try {
+      // simply delegate to the same path: we'll reuse logic by re-emitting as message handler
+      // create a synthetic ctx-like object
+      const chat = ctx.chat || {};
+      const chatIdStr = String(chat.id);
+      const chatType = chat.type || '';
+      const text = extractTextFromCtx(ctx);
+      if (!text) {
+        console.log('[relay] channel_post has no text; ignoring');
+        return;
+      }
+
+      // same acceptance rules as above
+      if (CHAT_ID && String(CHAT_ID) !== chatIdStr) {
+        console.log('[relay] channel_post ignored (not target chat). chat.id=', chatIdStr);
+        return;
+      }
+
+      const from = ctx.from || {};
+      const username = from.username ? String(from.username) : null;
+      const fromIdStr = from.id ? String(from.id) : null;
+      let mapped = null;
+      if (username && usernameMap[username.toLowerCase()]) mapped = usernameMap[username.toLowerCase()];
+      if (!mapped && fromIdStr && idMap[fromIdStr]) mapped = idMap[fromIdStr];
+      if (!mapped) {
+        if (username) mapped = username;
+        else if (from.first_name || from.last_name) mapped = (from.first_name || '') + (from.last_name ? ' ' + from.last_name : '');
+        else mapped = fromIdStr || '[TG]';
+      }
+
+      const msgObj = {
+        id: genId(),
+        origin: 'telegram',
+        sender: mapped,
+        message: text,
+        ts: Date.now()
+      };
+      const payload = JSON.stringify(msgObj);
+      console.log('[relay] channel_post tg->broadcast payload=', payload);
+
+      wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) client.send(payload);
+      });
+
+    } catch (e) {
+      console.error('[relay] channel_post handler err', e);
+    }
+  });
+
+  // simple /start handler
   bot.start((ctx) => ctx.reply('Relay bot active.'));
+
 } else {
   console.log('[relay] Telegram DISABLED. BOT_TOKEN present?', !!BOT_TOKEN, 'CHAT_ID present?', !!CHAT_ID);
 }
 
-// ----------- Start server -------------
+// start server
 server.listen(PORT, () => {
   console.log('[relay] http+ws listening on', PORT);
 });
 
-// periodic cleanup
-setInterval(() => {
-  pruneRecent();
-}, 2000);
+// cleanup interval
+setInterval(() => { pruneRecent(); }, 2000);
